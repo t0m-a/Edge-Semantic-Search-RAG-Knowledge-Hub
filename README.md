@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://tsimon.me/edge-lab-logo.svg" width="100%" alt="Edge RAG Hub Banner" />
+<img src="https://tsimon.me/edge-lab-logo.png" width="100%" alt="Edge RAG Hub Banner" />
 
 [![Hardware: Raspberry Pi 5](https://img.shields.io/badge/Hardware-Raspberry_Pi_5_(ARM64)-C51A4A?style=for-the-badge&logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11--slim--bookworm-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
