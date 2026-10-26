@@ -1,0 +1,24 @@
+# === Python Caches ===
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# === OS Logs & System Files ===
+*.log
+/var/log/
+.cache/
+
+# === Linux/Raspberry Pi System Junk ===
+.DS_Store
+.directory
+.Trash-*/
+*~
+
+# === IDE & Local Environment Configs ===
+.vscode/
+.idea/
+.env

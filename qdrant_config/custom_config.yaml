@@ -1,0 +1,9 @@
+storage:
+  on_disk_payload: true
+  optimizers:
+    indexing_threshold_kb: 10000
+    memmap_threshold_kb: 20000
+
+service:
+  enable_tls: false
+  max_request_size_mb: 32

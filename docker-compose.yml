@@ -1,0 +1,69 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: edge-qdrant
+    restart: unless-stopped
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY}
+    volumes:
+      - ./qdrant_data:/qdrant/storage
+      - ./qdrant_config/custom_config.yaml:/qdrant/config/custom_config.yaml:ro
+    command: ./qdrant --config-path config/custom_config.yaml
+    # Expose to localhost ONLY if you want to inspect http://localhost:6333/dashboard via SSH tunnel
+    ports:
+      - "127.0.0.1:6333:6333"
+    networks:
+      - edge_rag_internal
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+          cpus: "2.0"
+
+  rag-ui:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: edge-rag-ui
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION}
+      - FASTEMBED_CACHE_PATH=/app/model_cache
+    volumes:
+      - ./fastembed_cache:/app/model_cache
+    networks:
+      - edge_rag_internal
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: edge-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - rag-ui
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    networks:
+      - edge_rag_internal
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+networks:
+  edge_rag_internal:
+    driver: bridge
