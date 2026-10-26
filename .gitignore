@@ -22,6 +22,8 @@ ENV/
 .vscode/
 .idea/
 .env
+.env.*
+!.env.example
 
 # === Runtime Storage & Model Caches ===
 qdrant_data/

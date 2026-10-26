@@ -36,9 +36,15 @@ services:
       - FASTEMBED_CACHE_PATH=/app/model_cache
       - KNOWLEDGE_BASE_DIR=/app/knowledge_base
       - DEFAULT_CATEGORIES=${DEFAULT_CATEGORIES:-Network,Cloud,Infrastructure,Database,Security,Python,Documentation}
+      - ADMIN_EMAILS=${ADMIN_EMAILS:-ts67200@gmail.com}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      - DEFAULT_LOCAL_MODEL=${DEFAULT_LOCAL_MODEL:-gemma3:1b}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
-      - LLM_MODEL=${LLM_MODEL:-gemini-3.8-flash}
+      - LLM_MODEL=${LLM_MODEL:-gemini-2.5-flash}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./fastembed_cache:/app/model_cache
       - ./knowledge_base:/app/knowledge_base

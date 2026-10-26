@@ -1,3 +1,4 @@
+import hmac
 import os
 import re
 import time
@@ -36,12 +37,25 @@ CACHE_DIR = os.getenv("FASTEMBED_CACHE_PATH", "/app/model_cache")
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 VECTOR_DIM = 384
 
-# LLM RAG Configuration
+# LLM RAG Configuration (Local Pi 5 Ollama + Optional Cloud API Burst)
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"
+)
+DEFAULT_LOCAL_MODEL = os.getenv("DEFAULT_LOCAL_MODEL", "gemma3:1b")
+
+LOCAL_PI_MODELS = {
+    "gemma3:1b": "🍓 Local Pi 5 — gemma3:1b (Fast & Modern)",
+    "gemma2-2048:latest": "🍓 Local Pi 5 — gemma2-2048:latest (2048 Token Context)",
+    "gemma2:2b": "🍓 Local Pi 5 — gemma2:2b (Balanced 2B)",
+    "deepseek-r1:1.5b": "🧠 Local Pi 5 — deepseek-r1:1.5b (Reasoning <think>)",
+    "tinyllama:latest": "🚀 Local Pi 5 — tinyllama:latest (Ultra-Low Latency)",
+}
+
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv(
     "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
 )
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 
 DEFAULT_CATEGORIES = [
     c.strip()
@@ -52,11 +66,47 @@ DEFAULT_CATEGORIES = [
     if c.strip()
 ]
 
+# Independent Application-Level Admin Auth (No Cloudflare Zero Trust dependency)
+ADMIN_EMAILS = [
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "ts67200@gmail.com").split(",")
+    if e.strip()
+]
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+
 st.set_page_config(
     page_title="Edge Semantic Search & RAG Hub",
     page_icon="⚡",
     layout="wide",
 )
+
+if "is_admin" not in st.session_state:
+    st.session_state["is_admin"] = False
+if "admin_email" not in st.session_state:
+    st.session_state["admin_email"] = ""
+
+
+def verify_admin_credentials(email: str, password: str) -> bool:
+    """Verifies email against ADMIN_EMAILS and password against ADMIN_PASSWORD in constant time."""
+    if not ADMIN_PASSWORD or not email or not password:
+        return False
+    normalized_email = email.strip().lower()
+    email_matched = any(
+        hmac.compare_digest(normalized_email, allowed) for allowed in ADMIN_EMAILS
+    )
+    password_matched = hmac.compare_digest(password, ADMIN_PASSWORD)
+    return email_matched and password_matched
+
+
+def render_admin_lock_notice(feature_name: str):
+    """Renders a clean access-restricted notice on protected tabs for public visitors."""
+    with st.container(border=True):
+        st.subheader(f"🔒 {feature_name} — Administrator Access Required")
+        st.markdown(
+            "This tab is restricted to authorized administrators to protect vector database integrity and downstream Git synchronization.\n\n"
+            "* **🌍 Public Visitors:** Use the **🔎 Semantic Retrieval & RAG** tab to search the knowledge base and synthesize cited AI answers.\n"
+            "* **🔐 Administrators:** Open **🔐 Admin Sign In** in the left sidebar and sign in with your authorized email and password."
+        )
 
 
 # --- CACHED INITIALIZATION ---
@@ -76,10 +126,45 @@ def get_qdrant_client():
 
 
 @st.cache_resource
+def get_ollama_client():
+    return OpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL, timeout=120.0)
+
+
+@st.cache_resource
 def get_llm_client():
     if not LLM_API_KEY:
         return None
-    return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, timeout=60.0)
+
+
+def get_model_catalog(_ollama_client: OpenAI) -> dict[str, dict]:
+    """Builds the unified catalog of local Raspberry Pi Ollama models + optional Cloud API."""
+    catalog = {}
+    for model_id, label in LOCAL_PI_MODELS.items():
+        catalog[model_id] = {"label": label, "provider": "ollama", "model": model_id}
+
+    # Auto-discover any additional models installed in local Ollama
+    try:
+        resp = _ollama_client.models.list()
+        for m in getattr(resp, "data", []):
+            mid = getattr(m, "id", "")
+            if mid and mid not in catalog:
+                catalog[mid] = {
+                    "label": f"🍓 Local Pi 5 — {mid}",
+                    "provider": "ollama",
+                    "model": mid,
+                }
+    except Exception:
+        pass
+
+    if LLM_API_KEY:
+        cloud_key = f"cloud:{LLM_MODEL}"
+        catalog[cloud_key] = {
+            "label": f"☁️ Google AI Studio — {LLM_MODEL} (Auto-Fallback to Pi 5)",
+            "provider": "cloud",
+            "model": LLM_MODEL,
+        }
+    return catalog
 
 
 def ensure_collection(client: QdrantClient):
@@ -155,11 +240,13 @@ def get_kb_inventory(kb_root: Path = KNOWLEDGE_BASE_DIR) -> dict:
 # --- INITIALIZE SERVICES IN STRICT ORDER ---
 embedder = load_embedder()
 qdrant = get_qdrant_client()
+ollama_client = get_ollama_client()
 llm_client = get_llm_client()
 ensure_collection(qdrant)
 boot_sync_stats = auto_feed_knowledge_base(qdrant, embedder)
 ALL_CATEGORIES = get_active_categories(qdrant)
 kb_inventory = get_kb_inventory(KNOWLEDGE_BASE_DIR)
+MODEL_CATALOG = get_model_catalog(ollama_client)
 
 # --- SAMPLE PLAYBOOKS FOR RECRUITER DEMO ---
 SAMPLE_PLAYBOOKS = [
@@ -271,17 +358,37 @@ def save_note_to_kb(filename: str, category: str, title: str, content: str) -> P
     return target_path
 
 
-def build_rag_messages(user_query: str, hits: list) -> list[dict]:
-    """Formats retrieved Qdrant hits into numbered context blocks for strict citation."""
+def build_rag_messages(
+    user_query: str, hits: list, model_id: str = DEFAULT_LOCAL_MODEL, is_local: bool = True
+) -> list[dict]:
+    """
+    Formats retrieved Qdrant hits into numbered context blocks for strict citation.
+    Budgets context size automatically for local Pi 5 models (1B-2B / 2048 ctx)
+    to maintain fast ARM64 CPU prefill and prevent context window truncation.
+    """
+    if is_local:
+        max_chunks = 4 if "2048" in model_id else 3
+        max_chars_per_chunk = 1000 if "2048" in model_id else 800
+    else:
+        max_chunks = len(hits)
+        max_chars_per_chunk = 1500
+
+    selected_hits = hits[:max_chunks]
     context_blocks = []
-    for idx, hit in enumerate(hits, start=1):
-        p = hit.payload
+    for idx, hit in enumerate(selected_hits, start=1):
+        p = hit.payload or {}
+        raw_content = p.get("content", "")
+        trimmed_content = (
+            raw_content[:max_chars_per_chunk] + "..."
+            if len(raw_content) > max_chars_per_chunk
+            else raw_content
+        )
         block = (
             f"[{idx}] Title: {p.get('title', 'Untitled')} | "
             f"Source: {p.get('source', 'Unknown')} | "
             f"Category: {p.get('category', 'Uncategorized')} | "
             f"Similarity: {hit.score:.4f}\n"
-            f"Content: {p.get('content', '')}"
+            f"Content: {trimmed_content}"
         )
         context_blocks.append(block)
 
@@ -289,7 +396,7 @@ def build_rag_messages(user_query: str, hits: list) -> list[dict]:
 
     system_prompt = (
         "You are a Senior Infrastructure & SRE Technical Assistant. "
-        "Answer the user's question using ONLY the numbered context chunks provided below.\n"
+        "Synthesize a clear, direct, and actionable answer to the user's question using ONLY the numbered context chunks provided below.\n"
         "Rules:\n"
         "1. Cite every factual statement inline using bracketed numbers like [1] or [2] that correspond to the source chunk.\n"
         "2. End your response with a brief '### References' list mapping each used [number] to its Source and Title.\n"
@@ -321,65 +428,117 @@ with st.sidebar:
     col4.metric("Git Repos", len(kb_inventory["repos"]))
 
     st.markdown(f"**Embedder:** `{MODEL_NAME}` (ONNX)")
-    st.markdown(f"**LLM Engine:** `{LLM_MODEL if LLM_API_KEY else 'Not Configured'}`")
+    st.markdown(f"**Local Ollama:** `{len(LOCAL_PI_MODELS)} Pi 5 Models`")
+    st.markdown(f"**Cloud Burst:** `{LLM_MODEL if LLM_API_KEY else 'Disabled (Local Only)'}`")
     st.markdown(f"**Active Categories:** `{len(ALL_CATEGORIES)}`")
     st.divider()
 
-    if st.button("🔄 Sync knowledge_base & Git", use_container_width=True):
-        with st.spinner("Pulling downstream Git repos & indexing knowledge_base..."):
-            sync_stats = sync_knowledge_base(
-                client=qdrant,
-                embedder=embedder,
-                kb_root=KNOWLEDGE_BASE_DIR,
-                default_category="Documentation",
-                pull_git=True,
-                force_category=False,
-                only_missing=False,
+    if st.session_state["is_admin"]:
+        st.success(f"🔐 Admin: `{st.session_state['admin_email']}`")
+        if st.button("🔄 Sync knowledge_base & Git", use_container_width=True):
+            with st.spinner("Pulling downstream Git repos & indexing knowledge_base..."):
+                sync_stats = sync_knowledge_base(
+                    client=qdrant,
+                    embedder=embedder,
+                    kb_root=KNOWLEDGE_BASE_DIR,
+                    default_category="Documentation",
+                    pull_git=True,
+                    force_category=False,
+                    only_missing=False,
+                )
+            st.success(
+                f"Synced {sync_stats['files_processed']} files ({sync_stats['chunks_indexed']} chunks, "
+                f"{sync_stats['categories_preserved']} categories preserved) in {sync_stats['elapsed_ms']:.0f} ms!"
             )
-        st.success(
-            f"Synced {sync_stats['files_processed']} files ({sync_stats['chunks_indexed']} chunks, "
-            f"{sync_stats['categories_preserved']} categories preserved) in {sync_stats['elapsed_ms']:.0f} ms!"
-        )
-        st.rerun()
+            st.rerun()
 
-    if st.button("🚀 Load Sample NOC/SRE Playbooks", use_container_width=True):
-        with st.spinner("Vectorizing & indexing playbooks on Pi 5 CPU..."):
-            t0 = time.perf_counter()
-            for pb in SAMPLE_PLAYBOOKS:
-                save_note_to_kb(pb["source"], pb["category"], pb["title"], pb["content"])
-            ingest_chunks(SAMPLE_PLAYBOOKS, preserve_category=True)
-            elapsed = (time.perf_counter() - t0) * 1000
-        st.success(f"Indexed {len(SAMPLE_PLAYBOOKS)} playbooks in {elapsed:.1f} ms!")
-        st.rerun()
+        if st.button("🚀 Load Sample NOC/SRE Playbooks", use_container_width=True):
+            with st.spinner("Vectorizing & indexing playbooks on Pi 5 CPU..."):
+                t0 = time.perf_counter()
+                for pb in SAMPLE_PLAYBOOKS:
+                    save_note_to_kb(pb["source"], pb["category"], pb["title"], pb["content"])
+                ingest_chunks(SAMPLE_PLAYBOOKS, preserve_category=True)
+                elapsed = (time.perf_counter() - t0) * 1000
+            st.success(f"Indexed {len(SAMPLE_PLAYBOOKS)} playbooks in {elapsed:.1f} ms!")
+            st.rerun()
+
+        if st.button("🔓 Sign Out", use_container_width=True):
+            st.session_state["is_admin"] = False
+            st.session_state["admin_email"] = ""
+            st.rerun()
+    else:
+        with st.expander("🔐 Admin Sign In", expanded=False):
+            if not ADMIN_PASSWORD:
+                st.warning(
+                    "Set `ADMIN_PASSWORD` in `/opt/edge-rag-hub/.env` and recreate `rag-ui` to enable admin login."
+                )
+            else:
+                with st.form("admin_login_form", clear_on_submit=True):
+                    login_email = st.text_input(
+                        "Authorized Email", placeholder="ts67200@gmail.com"
+                    )
+                    login_pass = st.text_input("Admin Password", type="password")
+                    login_submit = st.form_submit_button(
+                        "Unlock Admin Tabs", use_container_width=True
+                    )
+                    if login_submit:
+                        if verify_admin_credentials(login_email, login_pass):
+                            st.session_state["is_admin"] = True
+                            st.session_state["admin_email"] = login_email.strip().lower()
+                            st.rerun()
+                        else:
+                            st.error("Invalid administrator email or password.")
 
 # --- MAIN UI ---
 st.title("🔍 Edge Semantic Search & RAG Knowledge Hub")
 st.markdown(
-    "Self-hosted on a **Raspberry Pi 5** using **Qdrant (Rust)** and **FastEmbed (Quantized ONNX)** behind **Cloudflare Zero Trust**."
+    "Self-hosted on a **Raspberry Pi 5** using **Qdrant (Rust)** and **FastEmbed (Quantized ONNX)**."
+)
+
+ingest_tab_label = (
+    "📥 Ingest & Git Sync" if st.session_state["is_admin"] else "🔒 Ingest & Git Sync"
+)
+analytics_tab_label = (
+    "📊 Vector Collection Explorer"
+    if st.session_state["is_admin"]
+    else "🔒 Vector Collection Explorer"
 )
 
 tab_search, tab_ingest, tab_analytics = st.tabs(
-    ["🔎 Semantic Retrieval & RAG", "📥 Ingest & Git Sync", "📊 Vector Collection Explorer"]
+    ["🔎 Semantic Retrieval & RAG", ingest_tab_label, analytics_tab_label]
 )
 
 with tab_search:
-    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([2.6, 1.8, 1.1, 1.0, 0.9])
     with c1:
         query = st.text_input(
             "Ask a technical question or describe an incident symptom:",
             placeholder="e.g., How do I fix a broken gateway tunnel between containers?",
         )
     with c2:
+        model_keys = list(MODEL_CATALOG.keys())
+        default_idx = (
+            model_keys.index(DEFAULT_LOCAL_MODEL)
+            if DEFAULT_LOCAL_MODEL in model_keys
+            else 0
+        )
+        selected_model_key = st.selectbox(
+            "RAG Synthesis Engine",
+            options=model_keys,
+            format_func=lambda k: MODEL_CATALOG[k]["label"],
+            index=default_idx,
+        )
+    with c3:
         category_filter = st.selectbox(
             "Filter Category",
             ["All"] + ALL_CATEGORIES,
         )
-    with c3:
-        min_score = st.slider("Min Cosine Score", 0.30, 0.95, 0.45, 0.05)
     with c4:
+        min_score = st.slider("Min Cosine Score", 0.30, 0.95, 0.45, 0.05)
+    with c5:
         st.write("")
         enable_rag = st.toggle(
-            "🤖 AI Answer", value=True, help="Synthesize an answer with LLM citations"
+            "🤖 AI Answer", value=True, help="Synthesize a tailored answer with citations"
         )
 
     if query:
@@ -417,27 +576,64 @@ with tab_search:
             )
         else:
             if enable_rag:
-                if not llm_client:
-                    st.info(
-                        "💡 Set `LLM_API_KEY` in `/opt/edge-rag-hub/.env` and recreate `rag-ui` to enable live AI answer synthesis."
+                chosen_spec = MODEL_CATALOG[selected_model_key]
+                active_provider = chosen_spec["provider"]
+                active_model = chosen_spec["model"]
+                is_local = active_provider == "ollama"
+
+                rag_messages = build_rag_messages(
+                    query, results, model_id=active_model, is_local=is_local
+                )
+
+                with st.container(border=True):
+                    st.subheader(
+                        f"🤖 Synthesized Answer — `{active_model}` ({'Local Pi 5 Ollama' if is_local else 'Google AI Studio'})"
                     )
-                else:
-                    rag_messages = build_rag_messages(query, results)
-                    with st.container(border=True):
-                        st.subheader("🤖 Synthesized Answer (Grounded in Qdrant Vectors)")
+                    t_llm_start = time.perf_counter()
+
+                    if not is_local and llm_client is not None:
                         try:
                             stream = llm_client.chat.completions.create(
-                                model=LLM_MODEL,
+                                model=active_model,
                                 messages=rag_messages,
                                 temperature=0.1,
                                 stream=True,
                             )
                             st.write_stream(stream)
-                        except Exception as e:
-                            st.error(f"LLM API Error: {e}")
+                            t_llm = time.perf_counter() - t_llm_start
+                            st.caption(f"⚡ **Cloud LLM Synthesis:** `{t_llm:.2f} s` (`{active_model}`)")
+                        except Exception as cloud_err:
+                            st.warning(
+                                f"⚠️ Cloud API limit/error (`{cloud_err}`) — automatically failing over to local Raspberry Pi 5 (`{DEFAULT_LOCAL_MODEL}`)..."
+                            )
+                            is_local = True
+                            active_model = DEFAULT_LOCAL_MODEL
+                            rag_messages = build_rag_messages(
+                                query, results, model_id=active_model, is_local=True
+                            )
 
-                        with st.expander("🔬 Inspect Augmented RAG Prompt Sent to LLM"):
-                            st.code(rag_messages[1]["content"], language="markdown")
+                    if is_local:
+                        try:
+                            t_llm_start = time.perf_counter()
+                            stream = ollama_client.chat.completions.create(
+                                model=active_model,
+                                messages=rag_messages,
+                                temperature=0.1,
+                                stream=True,
+                            )
+                            st.write_stream(stream)
+                            t_llm = time.perf_counter() - t_llm_start
+                            st.caption(
+                                f"🍓 **Local Pi 5 Ollama Synthesis:** `{t_llm:.2f} s` | **Model:** `{active_model}` | **Context Chunks Used:** `{min(len(results), 4 if '2048' in active_model else 3)}`"
+                            )
+                        except Exception as ollama_err:
+                            st.error(f"Local Ollama Connection Error (`{OLLAMA_BASE_URL}`): {ollama_err}")
+                            st.info(
+                                "💡 **Tip:** Ensure Ollama on the Raspberry Pi host listens on the Docker bridge by setting `OLLAMA_HOST=0.0.0.0:11434` in `/etc/systemd/system/ollama.service.d/override.conf` and restarting `ollama`."
+                            )
+
+                    with st.expander("🔬 Inspect Augmented RAG Prompt Sent to LLM"):
+                        st.code(rag_messages[1]["content"], language="markdown")
 
             st.subheader("📚 Retrieved Source Vectors")
             for idx, hit in enumerate(results, start=1):
@@ -454,291 +650,297 @@ with tab_search:
                         st.json({"point_id": hit.id, "score": hit.score, "payload": p})
 
 with tab_ingest:
-    st.subheader("Add Technical Documentation or Incident Notes")
-    with st.form("ingest_form", clear_on_submit=True):
-        doc_title = st.text_input("Document / Playbook Title")
-        col_cat1, col_cat2 = st.columns(2)
-        with col_cat1:
-            selected_cat = st.selectbox("Select Existing Category", ALL_CATEGORIES)
-        with col_cat2:
-            custom_cat = st.text_input(
-                "Or Create New Category (optional)",
-                placeholder="e.g., DevSecOps, Automation, Homelab",
-            )
-        doc_source = st.text_input("Source Filename / Reference", value="Manual-Entry.md")
-        doc_body = st.text_area("Content (Markdown or plain text)", height=150)
-        persist_to_kb = st.checkbox(
-            "Save Markdown file into /app/knowledge_base/notes/ for automatic persistence",
-            value=True,
-        )
-        submitted = st.form_submit_button("Vectorize & Store in Qdrant")
-
-        if submitted and doc_title and doc_body:
-            final_category = custom_cat.strip() if custom_cat.strip() else selected_cat
-            t0 = time.perf_counter()
-            if persist_to_kb:
-                saved_path = save_note_to_kb(doc_source, final_category, doc_title, doc_body)
-                index_files_into_qdrant(
-                    client=qdrant,
-                    embedder=embedder,
-                    files=[saved_path],
-                    kb_root=KNOWLEDGE_BASE_DIR,
-                    default_category=final_category,
-                    explicit_category=final_category,
-                    force_category=True,
+    if not st.session_state["is_admin"]:
+        render_admin_lock_notice("Ingest & Git Sync")
+    else:
+        st.subheader("Add Technical Documentation or Incident Notes")
+        with st.form("ingest_form", clear_on_submit=True):
+            doc_title = st.text_input("Document / Playbook Title")
+            col_cat1, col_cat2 = st.columns(2)
+            with col_cat1:
+                selected_cat = st.selectbox("Select Existing Category", ALL_CATEGORIES)
+            with col_cat2:
+                custom_cat = st.text_input(
+                    "Or Create New Category (optional)",
+                    placeholder="e.g., DevSecOps, Automation, Homelab",
                 )
-            else:
-                ingest_chunks(
-                    [
-                        {
-                            "title": doc_title,
-                            "category": final_category,
-                            "source": doc_source,
-                            "content": doc_body,
-                        }
-                    ],
-                    preserve_category=False,
-                )
-            ms = (time.perf_counter() - t0) * 1000
-            st.success(f"Stored vector under '{final_category}' in {ms:.1f} ms!")
-            st.rerun()
-
-    st.divider()
-    col_u1, col_u2 = st.columns(2)
-
-    with col_u1:
-        st.subheader("📂 Upload Markdown Files (.md)")
-        uploaded_files = st.file_uploader(
-            "Drag and drop Markdown notes (saved to knowledge_base/notes)",
-            type=["md", "mdx", "txt"],
-            accept_multiple_files=True,
-        )
-        upload_cat = st.selectbox("Tag Category", ALL_CATEGORIES, key="up_cat")
-        upload_custom_cat = st.text_input(
-            "Or New Category for Upload (optional)", key="up_custom_cat"
-        )
-        force_up_cat = st.checkbox(
-            "Overwrite category if document was already customized in Qdrant",
-            value=False,
-            key="force_up_cat",
-        )
-        if st.button("Vectorize Uploaded Files", use_container_width=True) and uploaded_files:
-            target_cat = (
-                upload_custom_cat.strip() if upload_custom_cat.strip() else upload_cat
+            doc_source = st.text_input("Source Filename / Reference", value="Manual-Entry.md")
+            doc_body = st.text_area("Content (Markdown or plain text)", height=150)
+            persist_to_kb = st.checkbox(
+                "Save Markdown file into /app/knowledge_base/notes/ for automatic persistence",
+                value=True,
             )
-            notes_dir, _ = ensure_kb_directories(KNOWLEDGE_BASE_DIR)
-            safe_cat_dir = notes_dir / re.sub(r"[^A-Za-z0-9._-]+", "_", target_cat)
-            safe_cat_dir.mkdir(parents=True, exist_ok=True)
+            submitted = st.form_submit_button("Vectorize & Store in Qdrant")
 
-            saved_paths = []
-            for uf in uploaded_files:
-                raw_text = uf.read().decode("utf-8", errors="ignore")
-                dest_path = safe_cat_dir / Path(uf.name).name
-                dest_path.write_text(raw_text, encoding="utf-8")
-                saved_paths.append(dest_path)
-
-            stats = index_files_into_qdrant(
-                client=qdrant,
-                embedder=embedder,
-                files=saved_paths,
-                kb_root=KNOWLEDGE_BASE_DIR,
-                default_category=target_cat,
-                explicit_category=target_cat,
-                force_category=force_up_cat,
-            )
-            st.success(
-                f"Saved {len(saved_paths)} file(s) to knowledge_base & indexed "
-                f"{stats['chunks_indexed']} chunks under '{target_cat}'!"
-            )
-            st.rerun()
-
-    with col_u2:
-        st.subheader("🐙 Downstream Git Sync & Repo Ingestion")
-        repo_url = st.text_input(
-            "GitHub Repository HTTPS URL", placeholder="https://github.com/owner/repo"
-        )
-        repo_cat = st.selectbox("Repo Category", ALL_CATEGORIES, key="gh_cat")
-        repo_custom_cat = st.text_input(
-            "Or New Category for Repo (optional)", key="gh_custom_cat"
-        )
-        force_repo_cat = st.checkbox(
-            "Overwrite existing Qdrant category updates on re-sync",
-            value=False,
-            key="force_repo_cat",
-        )
-        if st.button("Clone / Pull & Index Repository", use_container_width=True) and repo_url:
-            target_repo_cat = (
-                repo_custom_cat.strip() if repo_custom_cat.strip() else repo_cat
-            )
-            with st.spinner("Cloning/pulling repository into knowledge_base/repos & vectorizing..."):
-                try:
-                    repo_path = clone_or_pull_repo(
-                        repo_url, KNOWLEDGE_BASE_DIR / "repos"
-                    )
-                    md_files = scan_markdown_files(repo_path)
-                    stats = index_files_into_qdrant(
+            if submitted and doc_title and doc_body:
+                final_category = custom_cat.strip() if custom_cat.strip() else selected_cat
+                t0 = time.perf_counter()
+                if persist_to_kb:
+                    saved_path = save_note_to_kb(doc_source, final_category, doc_title, doc_body)
+                    index_files_into_qdrant(
                         client=qdrant,
                         embedder=embedder,
-                        files=md_files,
+                        files=[saved_path],
                         kb_root=KNOWLEDGE_BASE_DIR,
-                        default_category=target_repo_cat,
-                        explicit_category=target_repo_cat,
-                        force_category=force_repo_cat,
+                        default_category=final_category,
+                        explicit_category=final_category,
+                        force_category=True,
                     )
-                    st.success(
-                        f"Synced '{repo_path.name}': {stats['chunks_indexed']} chunks from "
-                        f"{stats['files_processed']} files ({stats['categories_preserved']} categories preserved)!"
+                else:
+                    ingest_chunks(
+                        [
+                            {
+                                "title": doc_title,
+                                "category": final_category,
+                                "source": doc_source,
+                                "content": doc_body,
+                            }
+                        ],
+                        preserve_category=False,
                     )
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Git sync failed: {e}")
+                ms = (time.perf_counter() - t0) * 1000
+                st.success(f"Stored vector under '{final_category}' in {ms:.1f} ms!")
+                st.rerun()
 
-    st.divider()
-    st.subheader("🗄️ Automatic `knowledge_base` Folder & Downstream Git Status")
-    col_kb1, col_kb2 = st.columns([2, 1])
-    with col_kb1:
-        st.markdown(
-            f"**Host Mount:** `/opt/edge-rag-hub/knowledge_base` → **Container:** `{KNOWLEDGE_BASE_DIR}`  \n"
-            f"**Local Markdown Notes (`notes/`):** `{len(kb_inventory['note_files'])}` files | "
-            f"**Downstream Cloned Repos (`repos/`):** `{len(kb_inventory['repos'])}` repositories"
-        )
-        if kb_inventory["repos"]:
+        st.divider()
+        col_u1, col_u2 = st.columns(2)
+
+        with col_u1:
+            st.subheader("📂 Upload Markdown Files (.md)")
+            uploaded_files = st.file_uploader(
+                "Drag and drop Markdown notes (saved to knowledge_base/notes)",
+                type=["md", "mdx", "txt"],
+                accept_multiple_files=True,
+            )
+            upload_cat = st.selectbox("Tag Category", ALL_CATEGORIES, key="up_cat")
+            upload_custom_cat = st.text_input(
+                "Or New Category for Upload (optional)", key="up_custom_cat"
+            )
+            force_up_cat = st.checkbox(
+                "Overwrite category if document was already customized in Qdrant",
+                value=False,
+                key="force_up_cat",
+            )
+            if st.button("Vectorize Uploaded Files", use_container_width=True) and uploaded_files:
+                target_cat = (
+                    upload_custom_cat.strip() if upload_custom_cat.strip() else upload_cat
+                )
+                notes_dir, _ = ensure_kb_directories(KNOWLEDGE_BASE_DIR)
+                safe_cat_dir = notes_dir / re.sub(r"[^A-Za-z0-9._-]+", "_", target_cat)
+                safe_cat_dir.mkdir(parents=True, exist_ok=True)
+
+                saved_paths = []
+                for uf in uploaded_files:
+                    raw_text = uf.read().decode("utf-8", errors="ignore")
+                    dest_path = safe_cat_dir / Path(uf.name).name
+                    dest_path.write_text(raw_text, encoding="utf-8")
+                    saved_paths.append(dest_path)
+
+                stats = index_files_into_qdrant(
+                    client=qdrant,
+                    embedder=embedder,
+                    files=saved_paths,
+                    kb_root=KNOWLEDGE_BASE_DIR,
+                    default_category=target_cat,
+                    explicit_category=target_cat,
+                    force_category=force_up_cat,
+                )
+                st.success(
+                    f"Saved {len(saved_paths)} file(s) to knowledge_base & indexed "
+                    f"{stats['chunks_indexed']} chunks under '{target_cat}'!"
+                )
+                st.rerun()
+
+        with col_u2:
+            st.subheader("🐙 Downstream Git Sync & Repo Ingestion")
+            repo_url = st.text_input(
+                "GitHub Repository HTTPS URL", placeholder="https://github.com/owner/repo"
+            )
+            repo_cat = st.selectbox("Repo Category", ALL_CATEGORIES, key="gh_cat")
+            repo_custom_cat = st.text_input(
+                "Or New Category for Repo (optional)", key="gh_custom_cat"
+            )
+            force_repo_cat = st.checkbox(
+                "Overwrite existing Qdrant category updates on re-sync",
+                value=False,
+                key="force_repo_cat",
+            )
+            if st.button("Clone / Pull & Index Repository", use_container_width=True) and repo_url:
+                target_repo_cat = (
+                    repo_custom_cat.strip() if repo_custom_cat.strip() else repo_cat
+                )
+                with st.spinner("Cloning/pulling repository into knowledge_base/repos & vectorizing..."):
+                    try:
+                        repo_path = clone_or_pull_repo(
+                            repo_url, KNOWLEDGE_BASE_DIR / "repos"
+                        )
+                        md_files = scan_markdown_files(repo_path)
+                        stats = index_files_into_qdrant(
+                            client=qdrant,
+                            embedder=embedder,
+                            files=md_files,
+                            kb_root=KNOWLEDGE_BASE_DIR,
+                            default_category=target_repo_cat,
+                            explicit_category=target_repo_cat,
+                            force_category=force_repo_cat,
+                        )
+                        st.success(
+                            f"Synced '{repo_path.name}': {stats['chunks_indexed']} chunks from "
+                            f"{stats['files_processed']} files ({stats['categories_preserved']} categories preserved)!"
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Git sync failed: {e}")
+
+        st.divider()
+        st.subheader("🗄️ Automatic `knowledge_base` Folder & Downstream Git Status")
+        col_kb1, col_kb2 = st.columns([2, 1])
+        with col_kb1:
+            st.markdown(
+                f"**Host Mount:** `/opt/edge-rag-hub/knowledge_base` → **Container:** `{KNOWLEDGE_BASE_DIR}`  \n"
+                f"**Local Markdown Notes (`notes/`):** `{len(kb_inventory['note_files'])}` files | "
+                f"**Downstream Cloned Repos (`repos/`):** `{len(kb_inventory['repos'])}` repositories"
+            )
+            if kb_inventory["repos"]:
+                st.dataframe(
+                    pd.DataFrame(kb_inventory["repos"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        with col_kb2:
+            if st.button(
+                "🔄 Pull All Downstream Git Repos & Re-Index KB",
+                use_container_width=True,
+                key="btn_full_kb_sync",
+            ):
+                with st.spinner("Running git pull --ff-only across all repos and indexing knowledge_base..."):
+                    sync_stats = sync_knowledge_base(
+                        client=qdrant,
+                        embedder=embedder,
+                        kb_root=KNOWLEDGE_BASE_DIR,
+                        default_category="Documentation",
+                        pull_git=True,
+                        force_category=False,
+                        only_missing=False,
+                    )
+                st.success(
+                    f"Indexed {sync_stats['chunks_indexed']} chunks across {sync_stats['files_processed']} files "
+                    f"(preserved {sync_stats['categories_preserved']} existing category updates)!"
+                )
+                if sync_stats.get("git_results"):
+                    st.json(sync_stats["git_results"])
+                st.rerun()
+
+with tab_analytics:
+    if not st.session_state["is_admin"]:
+        render_admin_lock_notice("Vector Collection Explorer")
+    else:
+        pts, _ = qdrant.scroll(collection_name=COLLECTION_NAME, limit=250, with_payload=True)
+        if pts:
+            records = []
+            for p in pts:
+                payload = p.payload or {}
+                records.append(
+                    {
+                        "id": str(p.id),
+                        "title": payload.get("title", "Untitled"),
+                        "category": payload.get("category", "Uncategorized"),
+                        "source": payload.get("source", "Unknown"),
+                        "indexed_at": payload.get("indexed_at", ""),
+                    }
+                )
+            df = pd.DataFrame(records)
             st.dataframe(
-                pd.DataFrame(kb_inventory["repos"]),
+                df[["id", "title", "category", "source", "indexed_at"]],
                 use_container_width=True,
                 hide_index=True,
             )
-    with col_kb2:
-        if st.button(
-            "🔄 Pull All Downstream Git Repos & Re-Index KB",
-            use_container_width=True,
-            key="btn_full_kb_sync",
-        ):
-            with st.spinner("Running git pull --ff-only across all repos and indexing knowledge_base..."):
-                sync_stats = sync_knowledge_base(
-                    client=qdrant,
-                    embedder=embedder,
-                    kb_root=KNOWLEDGE_BASE_DIR,
-                    default_category="Documentation",
-                    pull_git=True,
-                    force_category=False,
-                    only_missing=False,
-                )
-            st.success(
-                f"Indexed {sync_stats['chunks_indexed']} chunks across {sync_stats['files_processed']} files "
-                f"(preserved {sync_stats['categories_preserved']} existing category updates)!"
-            )
-            if sync_stats.get("git_results"):
-                st.json(sync_stats["git_results"])
-            st.rerun()
 
-with tab_analytics:
-    pts, _ = qdrant.scroll(collection_name=COLLECTION_NAME, limit=250, with_payload=True)
-    if pts:
-        records = []
-        for p in pts:
-            payload = p.payload or {}
-            records.append(
-                {
-                    "id": str(p.id),
-                    "title": payload.get("title", "Untitled"),
-                    "category": payload.get("category", "Uncategorized"),
-                    "source": payload.get("source", "Unknown"),
-                    "indexed_at": payload.get("indexed_at", ""),
+            st.divider()
+            col_upd_doc, col_upd_cat = st.columns(2)
+
+            with col_upd_doc:
+                st.subheader("✏️ Update Individual Document Category")
+                doc_options = {
+                    f"{r['title']} ({r['category']}) — [{r['id'][:8]}]": r for r in records
                 }
-            )
-        df = pd.DataFrame(records)
-        st.dataframe(
-            df[["id", "title", "category", "source", "indexed_at"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+                selected_doc_label = st.selectbox(
+                    "Select Document",
+                    options=list(doc_options.keys()),
+                    key="upd_doc_select",
+                )
+                selected_doc = doc_options[selected_doc_label]
 
-        st.divider()
-        col_upd_doc, col_upd_cat = st.columns(2)
+                new_doc_cat = st.selectbox(
+                    "New Category",
+                    options=ALL_CATEGORIES,
+                    index=ALL_CATEGORIES.index(selected_doc["category"])
+                    if selected_doc["category"] in ALL_CATEGORIES
+                    else 0,
+                    key="upd_doc_cat",
+                )
+                custom_doc_cat = st.text_input(
+                    "Or Enter Custom Category (optional)",
+                    placeholder="e.g., DevSecOps, Automation",
+                    key="upd_doc_custom_cat",
+                )
+                if st.button(
+                    "Update Document Category", key="btn_upd_doc", use_container_width=True
+                ):
+                    target_doc_cat = (
+                        custom_doc_cat.strip() if custom_doc_cat.strip() else new_doc_cat
+                    )
+                    qdrant.set_payload(
+                        collection_name=COLLECTION_NAME,
+                        payload={"category": target_doc_cat},
+                        points=[selected_doc["id"]],
+                    )
+                    st.success(
+                        f"Updated '{selected_doc['title']}' category to '{target_doc_cat}'!"
+                    )
+                    st.rerun()
 
-        with col_upd_doc:
-            st.subheader("✏️ Update Individual Document Category")
-            doc_options = {
-                f"{r['title']} ({r['category']}) — [{r['id'][:8]}]": r for r in records
-            }
-            selected_doc_label = st.selectbox(
-                "Select Document",
-                options=list(doc_options.keys()),
-                key="upd_doc_select",
-            )
-            selected_doc = doc_options[selected_doc_label]
-
-            new_doc_cat = st.selectbox(
-                "New Category",
-                options=ALL_CATEGORIES,
-                index=ALL_CATEGORIES.index(selected_doc["category"])
-                if selected_doc["category"] in ALL_CATEGORIES
-                else 0,
-                key="upd_doc_cat",
-            )
-            custom_doc_cat = st.text_input(
-                "Or Enter Custom Category (optional)",
-                placeholder="e.g., DevSecOps, Automation",
-                key="upd_doc_custom_cat",
-            )
-            if st.button(
-                "Update Document Category", key="btn_upd_doc", use_container_width=True
-            ):
-                target_doc_cat = (
-                    custom_doc_cat.strip() if custom_doc_cat.strip() else new_doc_cat
+            with col_upd_cat:
+                st.subheader("🏷️ Bulk Update Category")
+                present_categories = sorted({r["category"] for r in records})
+                old_cat = st.selectbox(
+                    "Select Category to Rename / Reassign",
+                    options=present_categories,
+                    key="upd_bulk_old_cat",
                 )
-                qdrant.set_payload(
-                    collection_name=COLLECTION_NAME,
-                    payload={"category": target_doc_cat},
-                    points=[selected_doc["id"]],
+                new_bulk_cat = st.selectbox(
+                    "Assign to Existing Category",
+                    options=ALL_CATEGORIES,
+                    index=ALL_CATEGORIES.index(old_cat)
+                    if old_cat in ALL_CATEGORIES
+                    else 0,
+                    key="upd_bulk_new_cat",
                 )
-                st.success(
-                    f"Updated '{selected_doc['title']}' category to '{target_doc_cat}'!"
+                custom_bulk_cat = st.text_input(
+                    "Or Enter New Category Name (optional)",
+                    placeholder="e.g., Core-Network, SRE",
+                    key="upd_bulk_custom_cat",
                 )
-                st.rerun()
-
-        with col_upd_cat:
-            st.subheader("🏷️ Bulk Update Category")
-            present_categories = sorted({r["category"] for r in records})
-            old_cat = st.selectbox(
-                "Select Category to Rename / Reassign",
-                options=present_categories,
-                key="upd_bulk_old_cat",
+                if st.button("Update Category", key="btn_upd_cat", use_container_width=True):
+                    target_bulk_cat = (
+                        custom_bulk_cat.strip() if custom_bulk_cat.strip() else new_bulk_cat
+                    )
+                    qdrant.set_payload(
+                        collection_name=COLLECTION_NAME,
+                        payload={"category": target_bulk_cat},
+                        points=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="category", match=MatchValue(value=old_cat)
+                                )
+                            ]
+                        ),
+                    )
+                    st.success(
+                        f"Updated all documents in '{old_cat}' to '{target_bulk_cat}'!"
+                    )
+                    st.rerun()
+        else:
+            st.info(
+                "Collection is currently empty. Click 'Load Sample NOC/SRE Playbooks' in the sidebar."
             )
-            new_bulk_cat = st.selectbox(
-                "Assign to Existing Category",
-                options=ALL_CATEGORIES,
-                index=ALL_CATEGORIES.index(old_cat)
-                if old_cat in ALL_CATEGORIES
-                else 0,
-                key="upd_bulk_new_cat",
-            )
-            custom_bulk_cat = st.text_input(
-                "Or Enter New Category Name (optional)",
-                placeholder="e.g., Core-Network, SRE",
-                key="upd_bulk_custom_cat",
-            )
-            if st.button("Update Category", key="btn_upd_cat", use_container_width=True):
-                target_bulk_cat = (
-                    custom_bulk_cat.strip() if custom_bulk_cat.strip() else new_bulk_cat
-                )
-                qdrant.set_payload(
-                    collection_name=COLLECTION_NAME,
-                    payload={"category": target_bulk_cat},
-                    points=Filter(
-                        must=[
-                            FieldCondition(
-                                key="category", match=MatchValue(value=old_cat)
-                            )
-                        ]
-                    ),
-                )
-                st.success(
-                    f"Updated all documents in '{old_cat}' to '{target_bulk_cat}'!"
-                )
-                st.rerun()
-    else:
-        st.info(
-            "Collection is currently empty. Click 'Load Sample NOC/SRE Playbooks' in the sidebar."
-        )

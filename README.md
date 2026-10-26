@@ -8,8 +8,9 @@
 [![Qdrant Rust Engine](https://img.shields.io/badge/Qdrant-Vector_DB_(Rust)-DC244C?style=for-the-badge&logo=rust&logoColor=white)](https://qdrant.tech/)
 [![FastEmbed ONNX](https://img.shields.io/badge/FastEmbed-0.4.2_(Quantized_ONNX)-00B4D8?style=for-the-badge&logo=onnx&logoColor=white)](https://github.com/qdrant/fastembed)
 [![Embedding Model](https://img.shields.io/badge/Model-BAAI%2Fbge--small--en--v1.5_(384d)-8A2BE2?style=for-the-badge&logo=huggingface&logoColor=white)](https://huggingface.co/BAAI/bge-small-en-v1.5)
-[![LLM Synthesis](https://img.shields.io/badge/RAG_Synthesis-OpenAI_SDK_(Streaming)-10A37F?style=for-the-badge&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
-[![Git Downstream Sync](https://img.shields.io/badge/Knowledge_Base-Auto_Git_Sync-F05032?style=for-the-badge&logo=git&logoColor=white)](#-%EF%B8%8F-automated-knowledge_base-feeder--downstream-git-sync)
+[![Local Ollama LLMs](https://img.shields.io/badge/Local_LLMs-Ollama_(Gemma_3_%E2%80%A2_DeepSeek--R1)-FFFFFF?style=for-the-badge&logo=ollama&logoColor=black)](https://ollama.com/)
+[![LLM Synthesis](https://img.shields.io/badge/Cloud_Burst-Google_Gemini_(Auto--Failover)-10A37F?style=for-the-badge&logo=google&logoColor=white)](https://ai.google.dev/)
+[![Git Downstream Sync](https://img.shields.io/badge/Knowledge_Base-Auto_Git_Sync-F05032?style=for-the-badge&logo=git&logoColor=white)](#%EF%B8%8F-automated-knowledge_base-feeder--downstream-git-sync)
 [![Docker Compose](https://img.shields.io/badge/Docker-Compose_Stack-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 [![Cloudflare Zero Trust](https://img.shields.io/badge/Ingress-Cloudflare_Zero_Trust-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://www.cloudflare.com/zero-trust/)
 [![Security: Non-Root](https://img.shields.io/badge/Container-Non--Root_(UID_1000)-2EA043?style=for-the-badge&logo=linux&logoColor=white)](#%EF%B8%8F-security--zero-trust-posture)
@@ -22,6 +23,7 @@
 [🏗️ Architecture](#%EF%B8%8F-system-architecture--data-flow) •
 [📂 Repository Map](#-repository-structure) •
 [🗄️ Auto-Feeder & Git Sync](#%EF%B8%8F-automated-knowledge_base-feeder--downstream-git-sync) •
+[🦙 Hybrid Ollama & Cloud RAG](#-hybrid-local-ollama--cloud-burst-rag-architecture) •
 [⚙️ Tech & Vector Specs](#%EF%B8%8F-vector-engine--embedding-specifications) •
 [🖥️ UI Features](#%EF%B8%8F-application-capabilities--ui-tour) •
 [🚀 Quick Start & CLI](#-deployment--operations) •
@@ -46,7 +48,8 @@
 | 🦀 **Rust HNSW Vector Engine** | `qdrant/qdrant:latest` with `Cosine` distance & `KEYWORD` payload indexing | Millisecond filtered similarity search with minimal memory footprint |
 | 🗄️ **Auto `knowledge_base` Feeder** | Startup & on-demand indexing of `/app/knowledge_base` (`notes/` & `repos/`) | Deterministic `UUIDv5` chunking that preserves UI category edits across re-syncs |
 | 🔄 **Downstream Git Sync** | Built-in `git clone --depth 1` & `git pull --ff-only` pipeline (`ingest.py`) | Keep external documentation repos and notes synchronized downstream with one click or cron |
-| 🤖 **Grounded LLM RAG Synthesis** | OpenAI-compatible streaming client (`openai>=1.52.0`) with strict citation rules | Generates answers grounded strictly in retrieved Qdrant vectors with `[1]`, `[2]` citations |
+| 🦙 **Hybrid Local Ollama + Cloud RAG** | 5 local Pi 5 Ollama models (`gemma3:1b`, `gemma2-2048`, `deepseek-r1:1.5b`, etc.) + Gemini Cloud Burst | 100% free local edge synthesis with automatic failover if cloud API quota is reached |
+| 🔐 **Role-Based Admin Guard** | Constant-time `hmac.compare_digest` auth (`ADMIN_EMAILS` + `ADMIN_PASSWORD`) | Leaves Semantic Search & RAG open to the public while locking Ingest, Git Sync & Category Ops |
 | 💾 **Flash/RAM Optimization** | `on_disk_payload: true` + `20 MB` `mmap` threshold + hard Docker cgroup caps | Prevents Linux OOM-killer events on 4 GB / 8 GB Raspberry Pi nodes |
 | 🛡️ **Zero Public Port Exposure** | Outbound-only `cloudflared` tunnel + Cloudflare Zero Trust OTP Access | No port forwarding (`80`/`443`/`8501`) on the edge router; Qdrant bound to `127.0.0.1` |
 
@@ -69,6 +72,7 @@ flowchart LR
 
     subgraph Pi5["🍓 Raspberry Pi 5 Host (ARM64 Linux - 4KB Page Size)"]
         Loopback["🔒 Host Loopback\n127.0.0.1:6333\n(SSH Tunnel Only)"]
+        Ollama["🦙 Host Ollama Engine (:11434)\ngemma3:1b • gemma2-2048:latest\ngemma2:2b • deepseek-r1:1.5b\ntinyllama:latest"]
 
         subgraph Bridge["🐳 Docker Bridge Network: edge_rag_internal"]
             CFD["🚇 edge-cloudflared\ncloudflare/cloudflared:latest\nRAM: 256M | CPU: 0.5"]
@@ -88,8 +92,9 @@ flowchart LR
     CF <==>|"Outbound Tunnel\n(TUNNEL_TOKEN)"| CFD
     CFD ==>|"HTTP :8501"| UI
     UI <==>|"REST API :6333\n(QDRANT_API_KEY)"| Qdrant
+    UI ==>|"host.docker.internal:11434\n(Local RAG Synthesis)"| Ollama
     UI -.->|"git clone / pull\n(Downstream Sync)"| GitHub
-    UI -.->|"Streaming RAG\n(LLM_API_KEY)"| LLM
+    UI -.->|"Cloud Burst + Failover\n(LLM_API_KEY)"| LLM
     Loopback -.->|"Port Bind"| Qdrant
     UI --- KB
     UI --- Cache
@@ -206,6 +211,29 @@ When indexing a new file from `/app/knowledge_base`, [`infer_file_category()`](f
 
 ---
 
+## 🦙 Hybrid Local Ollama & Cloud Burst RAG Architecture
+
+To deliver dynamic, cited answers without exhausting developer API quotas, [`app/main.py`](file:///z:/opt/edge-rag-hub/app/main.py) implements a **Hybrid Local + Cloud RAG Router** ([`get_model_catalog()`](file:///z:/opt/edge-rag-hub/app/main.py#L140-L165) and [`build_rag_messages()`](file:///z:/opt/edge-rag-hub/app/main.py#L361-L413)):
+
+### 1. Local Raspberry Pi 5 Ollama Engine (`host.docker.internal:11434/v1`)
+Connected via Docker's `extra_hosts: ["host.docker.internal:host-gateway"]` bridge, `edge-rag-ui` streams answers directly from the Ollama server running on the Raspberry Pi 5 host:
+
+| Local Model ID | Parameters | Context Budget | Ideal Use Case |
+| :--- | :---: | :---: | :--- |
+| `gemma3:1b` *(Default)* | `1B` | Top `3` chunks (`800` chars/chunk) | Fast, modern daily synthesis with zero cloud API usage |
+| `gemma2-2048:latest` | `2B` | Top `4` chunks (`1,000` chars/chunk) | Extended `2048`-token context window for multi-chunk runbooks |
+| `gemma2:2b` | `2B` | Top `3` chunks (`800` chars/chunk) | Balanced instruction following and citation accuracy |
+| `deepseek-r1:1.5b` | `1.5B` | Top `3` chunks (`800` chars/chunk) | Step-by-step chain-of-thought (`<think>`) root-cause analysis |
+| `tinyllama:latest` | `1.1B` | Top `3` chunks (`800` chars/chunk) | Ultra-low-latency CPU token generation |
+
+*(Any additional models pulled into Ollama on the host are automatically discovered via `/v1/models` on startup.)*
+
+### 2. Cloud Burst with Automatic Edge Failover
+* When `LLM_API_KEY` is configured in `.env`, the **RAG Synthesis Engine** dropdown exposes `☁️ Google AI Studio — gemini-2.5-flash (Auto-Fallback to Pi 5)`.
+* If the cloud API encounters a rate limit (`HTTP 429`) or network outage, [`app/main.py`](file:///z:/opt/edge-rag-hub/app/main.py#L540-L580) catches the exception, displays a failover notice, rebuilds the context-budgeted prompt, and seamlessly streams the response from the local Raspberry Pi 5 Ollama engine (`DEFAULT_LOCAL_MODEL`).
+
+---
+
 ## ⚙️ Vector Engine & Embedding Specifications
 
 ### 🧠 Quantized ONNX Embedding Model
@@ -243,24 +271,27 @@ service:
 
 The Streamlit application ([`app/main.py`](file:///z:/opt/edge-rag-hub/app/main.py)) is organized into a **Live Telemetry Sidebar** and **Three Operational Tabs**:
 
-### 1️⃣ Sidebar: Edge Node Telemetry & One-Click Sync
-* Displays live **Vectors Stored**, **Dimensions (`384`)**, **KB Files** count on disk, **Git Repos** count, active **Embedder**, **LLM Engine**, and **Active Categories**.
-* **🔄 Sync `knowledge_base` & Git:** Pulls downstream Git commits across all repositories in `/app/knowledge_base` and indexes new/modified files while preserving existing category assignments.
-* **🚀 Load Sample NOC/SRE Playbooks:** Persists 5 curated operational playbooks into `/app/knowledge_base/notes/<Category>/` and indexes them into Qdrant using deterministic `UUIDv5` IDs.
+### 1️⃣ Sidebar: Edge Node Telemetry, Admin Sign-In & One-Click Sync
+* **Public Telemetry:** Displays live **Vectors Stored**, **Dimensions (`384`)**, **KB Files** count on disk, **Git Repos** count, active **Embedder**, **LLM Engine**, and **Active Categories**.
+* **🔐 Independent Admin Sign-In (`verify_admin_credentials`):** Uses timing-attack-safe `hmac.compare_digest` verification against `ADMIN_EMAILS` (default `ts67200@gmail.com`) and `ADMIN_PASSWORD` in `.env`—operating completely independently of Cloudflare Zero Trust so the main search interface can remain open to the public while administrative actions remain locked.
+* **🔄 Sync `knowledge_base` & Git (Admin Only):** Pulls downstream Git commits across all repositories in `/app/knowledge_base` and indexes new/modified files while preserving existing category assignments.
+* **🚀 Load Sample NOC/SRE Playbooks (Admin Only):** Persists 5 curated operational playbooks into `/app/knowledge_base/notes/<Category>/` and indexes them into Qdrant using deterministic `UUIDv5` IDs.
 
-### 2️⃣ Tab 1: `🔎 Semantic Retrieval & RAG`
+### 2️⃣ Tab 1: `🔎 Semantic Retrieval & RAG` (Open to Public)
 * **Natural Language Querying:** Search by incident symptoms or architectural questions.
 * **Pre-Filtered HNSW Search:** Filter by `All` or any dynamically discovered category (`DEFAULT_CATEGORIES` merged with live Qdrant categories).
-* **🤖 Grounded AI Answer Synthesis:** Uses [`build_rag_messages()`](file:///z:/opt/edge-rag-hub/app/main.py#L263-L300) to format top retrieved chunks into numbered blocks (`[1]`, `[2]`) and streams an LLM response with strict inline citations, a `### References` section, and a **🔬 Inspect Augmented RAG Prompt** expander.
+* **🤖 Grounded AI Answer Synthesis:** Uses [`build_rag_messages()`](file:///z:/opt/edge-rag-hub/app/main.py#L299-L336) to format top retrieved chunks into numbered blocks (`[1]`, `[2]`) and streams an LLM response with strict inline citations, a `### References` section, and a **🔬 Inspect Augmented RAG Prompt** expander.
 * **Split-Timer Telemetry & Payload Inspector:** Displays separate execution timers (`ms`) for **ONNX CPU Embedding** vs. **Qdrant Rust Lookup**, plus raw JSON payload inspection per hit.
 
-### 3️⃣ Tab 2: `📥 Ingest & Git Sync`
+### 3️⃣ Tab 2: `📥 Ingest & Git Sync` (🔒 Protected — Authorized Admins Only)
+* Locked by default (`🔒 Ingest & Git Sync`) for public visitors; unlocks when an authorized administrator signs in via the sidebar.
 * **Manual Playbook Entry Form:** Vectorizes notes directly into Qdrant and optionally saves them as Markdown files with YAML frontmatter inside `/app/knowledge_base/notes/<Category>/`.
 * **📂 Batch Markdown File Uploader (`.md`, `.mdx`, `.txt`):** Saves uploaded files to `/app/knowledge_base/notes/<Category>/`, splits them by headers via [`chunk_markdown()`](file:///z:/opt/edge-rag-hub/app/ingest.py#L50-L97), and indexes them into Qdrant.
 * **🐙 Downstream Git Sync & Repo Ingestion:** Clones or pulls any GitHub repository into `/app/knowledge_base/repos/` and vectorizes its documentation.
 * **🗄️ Automatic `knowledge_base` Folder & Downstream Git Status:** Displays live inventory of local notes and cloned repositories with a one-click **Pull All Downstream Git Repos & Re-Index KB** action.
 
-### 4️⃣ Tab 3: `📊 Vector Collection Explorer`
+### 4️⃣ Tab 3: `📊 Vector Collection Explorer` (🔒 Protected — Authorized Admins Only)
+* Locked by default (`🔒 Vector Collection Explorer`) for public visitors; unlocks when an authorized administrator signs in via the sidebar.
 * **Collection Dataframe:** Scrolls up to 250 vectors from Qdrant and renders a sortable table of `id`, `title`, `category`, `source`, and `indexed_at`.
 * **✏️ Update Individual Document Category:** Uses `qdrant.set_payload()` targeting a specific point UUID to reclassify individual documents without re-embedding.
 * **🏷️ Bulk Update Category:** Uses `qdrant.set_payload()` with a `Filter(must=[FieldCondition(...)])` to atomically migrate all points under an existing category to a new category name.
@@ -297,22 +328,35 @@ QDRANT_COLLECTION=knowledge_hub
 # Default categories merged with live Qdrant categories
 DEFAULT_CATEGORIES=Network,Cloud,Infrastructure,Database,Security,Python,Documentation
 
-# OpenAI-Compatible LLM Configuration for RAG Synthesis
-LLM_API_KEY=<your_llm_api_key>
+# Application-Level Admin Access (Protects Ingest & Vector Explorer tabs)
+ADMIN_EMAILS=ts67200@gmail.com
+ADMIN_PASSWORD=<your_strong_admin_password>
+
+# Local Raspberry Pi 5 Ollama Engine (Default RAG Synthesis)
+OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+DEFAULT_LOCAL_MODEL=gemma3:1b
+
+# Optional Cloud Burst: Google AI Studio (Auto-falls back to Local Pi 5 on quota limits)
+LLM_API_KEY=<your_optional_google_ai_studio_key>
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
-LLM_MODEL=gemini-3.8-flash
+LLM_MODEL=gemini-2.5-flash
 
 # Optional: Personal Access Token for private GitHub repository cloning/pulling
 GITHUB_PAT=
 ```
 
-### 2. Build & Launch the Stack
+### 2. Expose Host Ollama to the Docker Bridge & Launch the Stack
 
 ```bash
-# Ensure non-root container user (UID 1000) owns bind-mounted directories
+# 1. Allow edge-rag-ui container to reach host Ollama on port 11434 via host.docker.internal
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+printf "[Service]\nEnvironment=\"OLLAMA_HOST=0.0.0.0:11434\"\n" | sudo tee /etc/systemd/system/ollama.service.d/override.conf
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+# 2. Ensure non-root container user (UID 1000) owns bind-mounted directories
 sudo chown -R 1000:1000 /opt/edge-rag-hub/knowledge_base /opt/edge-rag-hub/fastembed_cache /opt/edge-rag-hub/qdrant_data
 
-# Build and start all services in detached mode
+# 3. Build and start all services in detached mode
 cd /opt/edge-rag-hub && docker compose up -d --build
 ```
 
@@ -358,9 +402,10 @@ All previously identified architectural items have been resolved and verified in
 > * [`docker-compose.yml`](file:///z:/opt/edge-rag-hub/docker-compose.yml) bind-mounts `./knowledge_base:/app/knowledge_base` into `edge-rag-ui`.
 
 > [!TIP]
-> **3. Strict Initialization Order & Idempotent Category Preservation**
-> * [`app/main.py`](file:///z:/opt/edge-rag-hub/app/main.py#L146-L152) enforces a strict startup sequence: `load_embedder()` → `get_qdrant_client()` → `get_llm_client()` → `ensure_collection(qdrant)` → `auto_feed_knowledge_base(qdrant, embedder)` → `get_active_categories(qdrant)`.
+> **3. Strict Initialization Order, Hybrid LLM Failover & Idempotent Category Preservation**
+> * [`app/main.py`](file:///z:/opt/edge-rag-hub/app/main.py#L204-L213) enforces a strict startup sequence: `load_embedder()` → `get_qdrant_client()` → `get_ollama_client()` → `get_llm_client()` → `ensure_collection(qdrant)` → `auto_feed_knowledge_base(qdrant, embedder)` → `get_active_categories(qdrant)` → `get_model_catalog(ollama_client)`.
 > * Re-indexing files from `/app/knowledge_base` or downstream Git repositories uses deterministic `UUIDv5` IDs and checks existing payloads in Qdrant first, guaranteeing that manual or bulk category changes made in the UI are never overwritten unintentionally.
+> * Application-level administrator authentication (`ADMIN_EMAILS` + `ADMIN_PASSWORD` verified via `hmac.compare_digest`) locks the **Ingest & Git Sync** and **Vector Collection Explorer** tabs while keeping **Semantic Retrieval & RAG** open to the public without depending on Cloudflare Zero Trust policies.
 > * [`.gitignore`](file:///z:/opt/edge-rag-hub/.gitignore) excludes `.env`, `qdrant_data/`, `fastembed_cache/`, and cloned external sub-repositories (`knowledge_base/repos/*`) while keeping `knowledge_base/notes/` tracked in Git.
 
 ---
