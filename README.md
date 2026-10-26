@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0F2027,50:203A43,100:2C5364&height=230&section=header&text=%E2%9A%A1%20Edge%20RAG%20%26%20Semantic%20Search%20Hub&fontSize=38&fontColor=00F2FE&fontAlignY=38&desc=Self-Hosted%20ARM64%20Vector%20Knowledge%20Engine%20%E2%80%A2%20Qdrant%20(Rust)%20%E2%80%A2%20FastEmbed%20(ONNX)%20%E2%80%A2%20Cloudflare%20Zero%20Trust&descAlignY=60&descSize=16&descColor=E0F7FA" width="100%" alt="Edge RAG Hub Banner" />
+<img src="https://tsimon.me/edge-lab-logo.svg" width="100%" alt="Edge RAG Hub Banner" />
 
 [![Hardware: Raspberry Pi 5](https://img.shields.io/badge/Hardware-Raspberry_Pi_5_(ARM64)-C51A4A?style=for-the-badge&logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11--slim--bookworm-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
