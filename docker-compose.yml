@@ -34,8 +34,14 @@ services:
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - QDRANT_COLLECTION=${QDRANT_COLLECTION}
       - FASTEMBED_CACHE_PATH=/app/model_cache
+      - KNOWLEDGE_BASE_DIR=/app/knowledge_base
+      - DEFAULT_CATEGORIES=${DEFAULT_CATEGORIES:-Network,Cloud,Infrastructure,Database,Security,Python,Documentation}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+      - LLM_MODEL=${LLM_MODEL:-gemini-3.8-flash}
     volumes:
       - ./fastembed_cache:/app/model_cache
+      - ./knowledge_base:/app/knowledge_base
     networks:
       - edge_rag_internal
     deploy:

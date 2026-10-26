@@ -22,3 +22,11 @@ ENV/
 .vscode/
 .idea/
 .env
+
+# === Runtime Storage & Model Caches ===
+qdrant_data/
+fastembed_cache/
+
+# === Cloned External Repositories in knowledge_base ===
+knowledge_base/repos/*
+!knowledge_base/repos/.gitkeep

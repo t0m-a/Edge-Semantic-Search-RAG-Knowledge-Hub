@@ -1,10 +1,12 @@
 import os
-import subprocess
+import re
 import time
 import uuid
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 from fastembed import TextEmbedding
+from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -15,6 +17,15 @@ from qdrant_client.models import (
     PointStruct,
     VectorParams,
 )
+from ingest import (
+    KNOWLEDGE_BASE_DIR,
+    chunk_markdown,
+    clone_or_pull_repo,
+    ensure_kb_directories,
+    index_files_into_qdrant,
+    scan_markdown_files,
+    sync_knowledge_base,
+)
 
 # --- CONFIGURATION ---
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
@@ -24,6 +35,13 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "knowledge_hub")
 CACHE_DIR = os.getenv("FASTEMBED_CACHE_PATH", "/app/model_cache")
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 VECTOR_DIM = 384
+
+# LLM RAG Configuration
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv(
+    "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash")
 
 DEFAULT_CATEGORIES = [
     c.strip()
@@ -40,10 +58,12 @@ st.set_page_config(
     layout="wide",
 )
 
+
 # --- CACHED INITIALIZATION ---
 @st.cache_resource(show_spinner="Loading quantized ONNX embedding model on ARM64 CPU...")
 def load_embedder():
     return TextEmbedding(model_name=MODEL_NAME, cache_dir=CACHE_DIR, threads=4)
+
 
 @st.cache_resource
 def get_qdrant_client():
@@ -53,6 +73,14 @@ def get_qdrant_client():
         api_key=QDRANT_API_KEY if QDRANT_API_KEY else None,
         https=False,
     )
+
+
+@st.cache_resource
+def get_llm_client():
+    if not LLM_API_KEY:
+        return None
+    return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+
 
 def ensure_collection(client: QdrantClient):
     collections = [c.name for c in client.get_collections().collections]
@@ -68,6 +96,25 @@ def ensure_collection(client: QdrantClient):
         field_schema=PayloadSchemaType.KEYWORD,
     )
 
+
+@st.cache_resource(show_spinner="Auto-syncing /app/knowledge_base into Qdrant...")
+def auto_feed_knowledge_base(_client: QdrantClient, _embedder: TextEmbedding) -> dict:
+    """
+    Automatically feeds Qdrant from /app/knowledge_base on container startup.
+    Pulls downstream git repos and indexes any files while preserving existing Qdrant categories.
+    """
+    ensure_kb_directories(KNOWLEDGE_BASE_DIR)
+    return sync_knowledge_base(
+        client=_client,
+        embedder=_embedder,
+        kb_root=KNOWLEDGE_BASE_DIR,
+        default_category="Documentation",
+        pull_git=True,
+        force_category=False,
+        only_missing=False,
+    )
+
+
 def get_active_categories(client: QdrantClient) -> list[str]:
     """Merges default categories with all unique categories currently inside Qdrant."""
     discovered = set(DEFAULT_CATEGORIES)
@@ -82,11 +129,37 @@ def get_active_categories(client: QdrantClient) -> list[str]:
             discovered.add(pt.payload["category"])
     return sorted(discovered)
 
-# --- INITIALIZE SERVICES IN ORDER ---
+
+def get_kb_inventory(kb_root: Path = KNOWLEDGE_BASE_DIR) -> dict:
+    """Returns counts and lists of local notes and cloned git repositories in knowledge_base."""
+    notes_dir, repos_dir = ensure_kb_directories(kb_root)
+    note_files = scan_markdown_files(notes_dir)
+    repos = []
+    if repos_dir.exists():
+        for d in sorted(repos_dir.iterdir()):
+            if d.is_dir() and (d / ".git").exists():
+                repos.append(
+                    {
+                        "name": d.name,
+                        "path": str(d),
+                        "md_count": len(scan_markdown_files(d)),
+                    }
+                )
+    return {
+        "note_files": note_files,
+        "repos": repos,
+        "total_md_files": len(scan_markdown_files(kb_root)),
+    }
+
+
+# --- INITIALIZE SERVICES IN STRICT ORDER ---
 embedder = load_embedder()
 qdrant = get_qdrant_client()
+llm_client = get_llm_client()
 ensure_collection(qdrant)
+boot_sync_stats = auto_feed_knowledge_base(qdrant, embedder)
 ALL_CATEGORIES = get_active_categories(qdrant)
+kb_inventory = get_kb_inventory(KNOWLEDGE_BASE_DIR)
 
 # --- SAMPLE PLAYBOOKS FOR RECRUITER DEMO ---
 SAMPLE_PLAYBOOKS = [
@@ -122,24 +195,117 @@ SAMPLE_PLAYBOOKS = [
     },
 ]
 
-def ingest_chunks(records):
-    texts = [f"{r['title']}: {r['content']}" for r in records]
+
+def ingest_chunks(records: list[dict], preserve_category: bool = True):
+    """
+    Vectorizes and upserts chunk records into Qdrant using deterministic UUIDv5 IDs.
+    If preserve_category=True, existing categories in Qdrant (e.g., from Category Update UI)
+    are preserved on re-ingestion.
+    """
+    if not records:
+        return
+
+    prepared = []
+    for idx, r in enumerate(records):
+        point_id = r.get("id") or str(
+            uuid.uuid5(uuid.NAMESPACE_DNS, f"{r['source']}:{r['title']}:{idx}")
+        )
+        prepared.append({**r, "id": point_id})
+
+    if preserve_category:
+        try:
+            existing_pts = qdrant.retrieve(
+                collection_name=COLLECTION_NAME,
+                ids=[p["id"] for p in prepared],
+                with_payload=["category"],
+                with_vectors=False,
+            )
+            existing_cats = {
+                str(pt.id): (pt.payload or {}).get("category") for pt in existing_pts
+            }
+            for p in prepared:
+                if existing_cats.get(p["id"]):
+                    p["category"] = existing_cats[p["id"]]
+        except Exception:
+            pass
+
+    texts = [f"{r['title']}: {r['content']}" for r in prepared]
     vectors = list(embedder.embed(texts))
+    now_utc = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+
     points = [
         PointStruct(
-            id=str(uuid.uuid4()),
+            id=r["id"],
             vector=vec.tolist(),
             payload={
                 "title": r["title"],
                 "category": r["category"],
                 "source": r["source"],
                 "content": r["content"],
-                "indexed_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+                "indexed_at": now_utc,
             },
         )
-        for r, vec in zip(records, vectors)
+        for r, vec in zip(prepared, vectors)
     ]
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+
+
+def save_note_to_kb(filename: str, category: str, title: str, content: str) -> Path:
+    """Persists a Markdown document inside /app/knowledge_base/notes/<category>/."""
+    notes_dir, _ = ensure_kb_directories(KNOWLEDGE_BASE_DIR)
+    safe_cat = re.sub(r"[^A-Za-z0-9._-]+", "_", category.strip()) or "Documentation"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name)
+    if not safe_name.lower().endswith((".md", ".mdx", ".txt")):
+        safe_name += ".md"
+
+    target_folder = notes_dir / safe_cat
+    target_folder.mkdir(parents=True, exist_ok=True)
+    target_path = target_folder / safe_name
+
+    if not content.lstrip().startswith("---"):
+        formatted = f"---\ncategory: {category}\n---\n\n# {title}\n\n{content.strip()}\n"
+    else:
+        formatted = content
+
+    target_path.write_text(formatted, encoding="utf-8")
+    return target_path
+
+
+def build_rag_messages(user_query: str, hits: list) -> list[dict]:
+    """Formats retrieved Qdrant hits into numbered context blocks for strict citation."""
+    context_blocks = []
+    for idx, hit in enumerate(hits, start=1):
+        p = hit.payload
+        block = (
+            f"[{idx}] Title: {p.get('title', 'Untitled')} | "
+            f"Source: {p.get('source', 'Unknown')} | "
+            f"Category: {p.get('category', 'Uncategorized')} | "
+            f"Similarity: {hit.score:.4f}\n"
+            f"Content: {p.get('content', '')}"
+        )
+        context_blocks.append(block)
+
+    formatted_context = "\n\n".join(context_blocks)
+
+    system_prompt = (
+        "You are a Senior Infrastructure & SRE Technical Assistant. "
+        "Answer the user's question using ONLY the numbered context chunks provided below.\n"
+        "Rules:\n"
+        "1. Cite every factual statement inline using bracketed numbers like [1] or [2] that correspond to the source chunk.\n"
+        "2. End your response with a brief '### References' list mapping each used [number] to its Source and Title.\n"
+        "3. If the provided context does not contain enough information to answer the question, state clearly that the knowledge base does not cover that topic—never invent facts."
+    )
+
+    user_prompt = (
+        f"### Retrieved Knowledge Base Context:\n{formatted_context}\n\n"
+        f"### User Question:\n{user_query}"
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
 
 # --- SIDEBAR TELEMETRY ---
 with st.sidebar:
@@ -149,13 +315,39 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     col1.metric("Vectors Stored", info.points_count)
     col2.metric("Dimensions", VECTOR_DIM)
-    st.markdown(f"**Model:** `{MODEL_NAME}` (ONNX)")
+
+    col3, col4 = st.columns(2)
+    col3.metric("KB Files", kb_inventory["total_md_files"])
+    col4.metric("Git Repos", len(kb_inventory["repos"]))
+
+    st.markdown(f"**Embedder:** `{MODEL_NAME}` (ONNX)")
+    st.markdown(f"**LLM Engine:** `{LLM_MODEL if LLM_API_KEY else 'Not Configured'}`")
     st.markdown(f"**Active Categories:** `{len(ALL_CATEGORIES)}`")
     st.divider()
+
+    if st.button("🔄 Sync knowledge_base & Git", use_container_width=True):
+        with st.spinner("Pulling downstream Git repos & indexing knowledge_base..."):
+            sync_stats = sync_knowledge_base(
+                client=qdrant,
+                embedder=embedder,
+                kb_root=KNOWLEDGE_BASE_DIR,
+                default_category="Documentation",
+                pull_git=True,
+                force_category=False,
+                only_missing=False,
+            )
+        st.success(
+            f"Synced {sync_stats['files_processed']} files ({sync_stats['chunks_indexed']} chunks, "
+            f"{sync_stats['categories_preserved']} categories preserved) in {sync_stats['elapsed_ms']:.0f} ms!"
+        )
+        st.rerun()
+
     if st.button("🚀 Load Sample NOC/SRE Playbooks", use_container_width=True):
         with st.spinner("Vectorizing & indexing playbooks on Pi 5 CPU..."):
             t0 = time.perf_counter()
-            ingest_chunks(SAMPLE_PLAYBOOKS)
+            for pb in SAMPLE_PLAYBOOKS:
+                save_note_to_kb(pb["source"], pb["category"], pb["title"], pb["content"])
+            ingest_chunks(SAMPLE_PLAYBOOKS, preserve_category=True)
             elapsed = (time.perf_counter() - t0) * 1000
         st.success(f"Indexed {len(SAMPLE_PLAYBOOKS)} playbooks in {elapsed:.1f} ms!")
         st.rerun()
@@ -167,11 +359,11 @@ st.markdown(
 )
 
 tab_search, tab_ingest, tab_analytics = st.tabs(
-    ["🔎 Semantic Retrieval", "📥 Ingest Knowledge", "📊 Vector Collection Explorer"]
+    ["🔎 Semantic Retrieval & RAG", "📥 Ingest & Git Sync", "📊 Vector Collection Explorer"]
 )
 
 with tab_search:
-    c1, c2, c3 = st.columns([3, 1, 1])
+    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
     with c1:
         query = st.text_input(
             "Ask a technical question or describe an incident symptom:",
@@ -183,7 +375,12 @@ with tab_search:
             ["All"] + ALL_CATEGORIES,
         )
     with c3:
-        min_score = st.slider("Min Cosine Score", 0.30, 0.95, 0.50, 0.05)
+        min_score = st.slider("Min Cosine Score", 0.30, 0.95, 0.45, 0.05)
+    with c4:
+        st.write("")
+        enable_rag = st.toggle(
+            "🤖 AI Answer", value=True, help="Synthesize an answer with LLM citations"
+        )
 
     if query:
         t_start = time.perf_counter()
@@ -211,21 +408,50 @@ with tab_search:
         t_search = (time.perf_counter() - t_qdrant_start) * 1000
 
         st.caption(
-            f"⏱️ **ONNX CPU Embedding:** `{t_embed:.1f} ms` | **Qdrant Rust Lookup:** `{t_search:.1f} ms` | **Matches:** `{len(results)}`"
+            f"⏱️ **ONNX CPU Embedding:** `{t_embed:.1f} ms` | **Qdrant Rust Lookup:** `{t_search:.1f} ms` | **Retrieved Chunks:** `{len(results)}`"
         )
 
         if not results:
-            st.warning("No semantic matches above threshold. Try lowering the Min Cosine Score or loading sample playbooks from the sidebar.")
-        for hit in results:
-            p = hit.payload
-            with st.container(border=True):
-                h_col1, h_col2 = st.columns([4, 1])
-                h_col1.subheader(f"📄 {p.get('title', 'Untitled')}")
-                h_col2.metric("Cosine Similarity", f"{hit.score:.4f}")
-                st.markdown(f"**Category:** `{p.get('category')}` | **Source:** `{p.get('source')}` | **Indexed:** `{p.get('indexed_at')}`")
-                st.write(p.get("content"))
-                with st.expander("Inspect Raw Qdrant Vector Payload"):
-                    st.json({"point_id": hit.id, "score": hit.score, "payload": p})
+            st.warning(
+                "No semantic matches above threshold. Try lowering the Min Cosine Score or loading sample playbooks from the sidebar."
+            )
+        else:
+            if enable_rag:
+                if not llm_client:
+                    st.info(
+                        "💡 Set `LLM_API_KEY` in `/opt/edge-rag-hub/.env` and recreate `rag-ui` to enable live AI answer synthesis."
+                    )
+                else:
+                    rag_messages = build_rag_messages(query, results)
+                    with st.container(border=True):
+                        st.subheader("🤖 Synthesized Answer (Grounded in Qdrant Vectors)")
+                        try:
+                            stream = llm_client.chat.completions.create(
+                                model=LLM_MODEL,
+                                messages=rag_messages,
+                                temperature=0.1,
+                                stream=True,
+                            )
+                            st.write_stream(stream)
+                        except Exception as e:
+                            st.error(f"LLM API Error: {e}")
+
+                        with st.expander("🔬 Inspect Augmented RAG Prompt Sent to LLM"):
+                            st.code(rag_messages[1]["content"], language="markdown")
+
+            st.subheader("📚 Retrieved Source Vectors")
+            for idx, hit in enumerate(results, start=1):
+                p = hit.payload
+                with st.container(border=True):
+                    h_col1, h_col2 = st.columns([4, 1])
+                    h_col1.subheader(f"[{idx}] 📄 {p.get('title', 'Untitled')}")
+                    h_col2.metric("Cosine Similarity", f"{hit.score:.4f}")
+                    st.markdown(
+                        f"**Category:** `{p.get('category')}` | **Source:** `{p.get('source')}` | **Indexed:** `{p.get('indexed_at')}`"
+                    )
+                    st.write(p.get("content"))
+                    with st.expander("Inspect Raw Qdrant Vector Payload"):
+                        st.json({"point_id": hit.id, "score": hit.score, "payload": p})
 
 with tab_ingest:
     st.subheader("Add Technical Documentation or Incident Notes")
@@ -241,21 +467,38 @@ with tab_ingest:
             )
         doc_source = st.text_input("Source Filename / Reference", value="Manual-Entry.md")
         doc_body = st.text_area("Content (Markdown or plain text)", height=150)
+        persist_to_kb = st.checkbox(
+            "Save Markdown file into /app/knowledge_base/notes/ for automatic persistence",
+            value=True,
+        )
         submitted = st.form_submit_button("Vectorize & Store in Qdrant")
 
         if submitted and doc_title and doc_body:
             final_category = custom_cat.strip() if custom_cat.strip() else selected_cat
             t0 = time.perf_counter()
-            ingest_chunks(
-                [
-                    {
-                        "title": doc_title,
-                        "category": final_category,
-                        "source": doc_source,
-                        "content": doc_body,
-                    }
-                ]
-            )
+            if persist_to_kb:
+                saved_path = save_note_to_kb(doc_source, final_category, doc_title, doc_body)
+                index_files_into_qdrant(
+                    client=qdrant,
+                    embedder=embedder,
+                    files=[saved_path],
+                    kb_root=KNOWLEDGE_BASE_DIR,
+                    default_category=final_category,
+                    explicit_category=final_category,
+                    force_category=True,
+                )
+            else:
+                ingest_chunks(
+                    [
+                        {
+                            "title": doc_title,
+                            "category": final_category,
+                            "source": doc_source,
+                            "content": doc_body,
+                        }
+                    ],
+                    preserve_category=False,
+                )
             ms = (time.perf_counter() - t0) * 1000
             st.success(f"Stored vector under '{final_category}' in {ms:.1f} ms!")
             st.rerun()
@@ -266,46 +509,128 @@ with tab_ingest:
     with col_u1:
         st.subheader("📂 Upload Markdown Files (.md)")
         uploaded_files = st.file_uploader(
-            "Drag and drop Markdown notes", type=["md", "txt"], accept_multiple_files=True
+            "Drag and drop Markdown notes (saved to knowledge_base/notes)",
+            type=["md", "mdx", "txt"],
+            accept_multiple_files=True,
         )
         upload_cat = st.selectbox("Tag Category", ALL_CATEGORIES, key="up_cat")
-        upload_custom_cat = st.text_input("Or New Category for Upload (optional)", key="up_custom_cat")
-        if st.button("Vectorize Uploaded Files") and uploaded_files:
-            from ingest import chunk_markdown
-            target_cat = upload_custom_cat.strip() if upload_custom_cat.strip() else upload_cat
-            batch_records = []
+        upload_custom_cat = st.text_input(
+            "Or New Category for Upload (optional)", key="up_custom_cat"
+        )
+        force_up_cat = st.checkbox(
+            "Overwrite category if document was already customized in Qdrant",
+            value=False,
+            key="force_up_cat",
+        )
+        if st.button("Vectorize Uploaded Files", use_container_width=True) and uploaded_files:
+            target_cat = (
+                upload_custom_cat.strip() if upload_custom_cat.strip() else upload_cat
+            )
+            notes_dir, _ = ensure_kb_directories(KNOWLEDGE_BASE_DIR)
+            safe_cat_dir = notes_dir / re.sub(r"[^A-Za-z0-9._-]+", "_", target_cat)
+            safe_cat_dir.mkdir(parents=True, exist_ok=True)
+
+            saved_paths = []
             for uf in uploaded_files:
                 raw_text = uf.read().decode("utf-8", errors="ignore")
-                for c in chunk_markdown(raw_text, fallback_title=uf.name):
-                    batch_records.append({
-                        "title": c["title"],
-                        "category": target_cat,
-                        "source": uf.name,
-                        "content": c["content"],
-                    })
-            ingest_chunks(batch_records)
-            st.success(f"Indexed {len(batch_records)} sections under '{target_cat}'!")
+                dest_path = safe_cat_dir / Path(uf.name).name
+                dest_path.write_text(raw_text, encoding="utf-8")
+                saved_paths.append(dest_path)
+
+            stats = index_files_into_qdrant(
+                client=qdrant,
+                embedder=embedder,
+                files=saved_paths,
+                kb_root=KNOWLEDGE_BASE_DIR,
+                default_category=target_cat,
+                explicit_category=target_cat,
+                force_category=force_up_cat,
+            )
+            st.success(
+                f"Saved {len(saved_paths)} file(s) to knowledge_base & indexed "
+                f"{stats['chunks_indexed']} chunks under '{target_cat}'!"
+            )
             st.rerun()
 
     with col_u2:
-        st.subheader("🐙 Ingest Public GitHub Repo")
-        repo_url = st.text_input("GitHub Repository HTTPS URL", placeholder="https://github.com/owner/repo")
+        st.subheader("🐙 Downstream Git Sync & Repo Ingestion")
+        repo_url = st.text_input(
+            "GitHub Repository HTTPS URL", placeholder="https://github.com/owner/repo"
+        )
         repo_cat = st.selectbox("Repo Category", ALL_CATEGORIES, key="gh_cat")
-        repo_custom_cat = st.text_input("Or New Category for Repo (optional)", key="gh_custom_cat")
-        if st.button("Clone & Index Repository") and repo_url:
-            target_repo_cat = repo_custom_cat.strip() if repo_custom_cat.strip() else repo_cat
-            with st.spinner("Cloning repository and vectorizing Markdown docs..."):
-                res = subprocess.run(
-                    ["python", "ingest.py", "--github", repo_url, "--category", target_repo_cat],
-                    capture_output=True,
-                    text=True,
+        repo_custom_cat = st.text_input(
+            "Or New Category for Repo (optional)", key="gh_custom_cat"
+        )
+        force_repo_cat = st.checkbox(
+            "Overwrite existing Qdrant category updates on re-sync",
+            value=False,
+            key="force_repo_cat",
+        )
+        if st.button("Clone / Pull & Index Repository", use_container_width=True) and repo_url:
+            target_repo_cat = (
+                repo_custom_cat.strip() if repo_custom_cat.strip() else repo_cat
+            )
+            with st.spinner("Cloning/pulling repository into knowledge_base/repos & vectorizing..."):
+                try:
+                    repo_path = clone_or_pull_repo(
+                        repo_url, KNOWLEDGE_BASE_DIR / "repos"
+                    )
+                    md_files = scan_markdown_files(repo_path)
+                    stats = index_files_into_qdrant(
+                        client=qdrant,
+                        embedder=embedder,
+                        files=md_files,
+                        kb_root=KNOWLEDGE_BASE_DIR,
+                        default_category=target_repo_cat,
+                        explicit_category=target_repo_cat,
+                        force_category=force_repo_cat,
+                    )
+                    st.success(
+                        f"Synced '{repo_path.name}': {stats['chunks_indexed']} chunks from "
+                        f"{stats['files_processed']} files ({stats['categories_preserved']} categories preserved)!"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Git sync failed: {e}")
+
+    st.divider()
+    st.subheader("🗄️ Automatic `knowledge_base` Folder & Downstream Git Status")
+    col_kb1, col_kb2 = st.columns([2, 1])
+    with col_kb1:
+        st.markdown(
+            f"**Host Mount:** `/opt/edge-rag-hub/knowledge_base` → **Container:** `{KNOWLEDGE_BASE_DIR}`  \n"
+            f"**Local Markdown Notes (`notes/`):** `{len(kb_inventory['note_files'])}` files | "
+            f"**Downstream Cloned Repos (`repos/`):** `{len(kb_inventory['repos'])}` repositories"
+        )
+        if kb_inventory["repos"]:
+            st.dataframe(
+                pd.DataFrame(kb_inventory["repos"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+    with col_kb2:
+        if st.button(
+            "🔄 Pull All Downstream Git Repos & Re-Index KB",
+            use_container_width=True,
+            key="btn_full_kb_sync",
+        ):
+            with st.spinner("Running git pull --ff-only across all repos and indexing knowledge_base..."):
+                sync_stats = sync_knowledge_base(
+                    client=qdrant,
+                    embedder=embedder,
+                    kb_root=KNOWLEDGE_BASE_DIR,
+                    default_category="Documentation",
+                    pull_git=True,
+                    force_category=False,
+                    only_missing=False,
                 )
-            if res.returncode == 0:
-                st.success(f"Repository indexed under '{target_repo_cat}'!")
-                st.code(res.stdout)
-                st.rerun()
-            else:
-                st.error(res.stderr)
+            st.success(
+                f"Indexed {sync_stats['chunks_indexed']} chunks across {sync_stats['files_processed']} files "
+                f"(preserved {sync_stats['categories_preserved']} existing category updates)!"
+            )
+            if sync_stats.get("git_results"):
+                st.json(sync_stats["git_results"])
+            st.rerun()
 
 with tab_analytics:
     pts, _ = qdrant.scroll(collection_name=COLLECTION_NAME, limit=250, with_payload=True)
@@ -357,7 +682,9 @@ with tab_analytics:
                 placeholder="e.g., DevSecOps, Automation",
                 key="upd_doc_custom_cat",
             )
-            if st.button("Update Document Category", key="btn_upd_doc", use_container_width=True):
+            if st.button(
+                "Update Document Category", key="btn_upd_doc", use_container_width=True
+            ):
                 target_doc_cat = (
                     custom_doc_cat.strip() if custom_doc_cat.strip() else new_doc_cat
                 )
@@ -412,4 +739,6 @@ with tab_analytics:
                 )
                 st.rerun()
     else:
-        st.info("Collection is currently empty. Click 'Load Sample NOC/SRE Playbooks' in the sidebar.")
+        st.info(
+            "Collection is currently empty. Click 'Load Sample NOC/SRE Playbooks' in the sidebar."
+        )
