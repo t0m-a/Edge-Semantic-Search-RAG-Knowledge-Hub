@@ -16,6 +16,8 @@
 [![Security: Non-Root](https://img.shields.io/badge/Container-Non--Root_(UID_1000)-2EA043?style=for-the-badge&logo=linux&logoColor=white)](#%EF%B8%8F-security--zero-trust-posture)
 
 <br />
+**All the demo platforms currently deployed and running under my main domain are not publicly accessible. Please, email me if you would like a live demo. Thank you.**
+<br />
 
 **A low-latency, memory-disciplined Semantic Search & Retrieval-Augmented Generation (RAG) Knowledge Hub engineered specifically for constrained ARM64 edge hardware.**
 
