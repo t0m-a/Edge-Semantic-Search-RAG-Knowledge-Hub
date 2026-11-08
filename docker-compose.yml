@@ -62,11 +62,17 @@ services:
       retries: 3
 
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    build:
+      context: ./cloudflared
+      dockerfile: Dockerfile
     container_name: edge-cloudflared
     restart: unless-stopped
     depends_on:
       - rag-ui
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    volumes:
+      - ./cloudflared_data:/var/lib/cloudflared
     command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
     networks:
       - edge_rag_internal

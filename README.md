@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://tsimon.me/edge-lab-logo.png" width="100%" alt="Edge RAG Hub Banner" />
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0F2027,50:203A43,100:2C5364&height=230&section=header&text=%E2%9A%A1%20Edge%20RAG%20%26%20Semantic%20Search%20Hub&fontSize=38&fontColor=00F2FE&fontAlignY=38&desc=Self-Hosted%20ARM64%20Vector%20Knowledge%20Engine%20%E2%80%A2%20Qdrant%20(Rust)%20%E2%80%A2%20FastEmbed%20(ONNX)%20%E2%80%A2%20Cloudflare%20Zero%20Trust&descAlignY=60&descSize=16&descColor=E0F7FA" width="100%" alt="Edge RAG Hub Banner" />
 
 [![Hardware: Raspberry Pi 5](https://img.shields.io/badge/Hardware-Raspberry_Pi_5_(ARM64)-C51A4A?style=for-the-badge&logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11--slim--bookworm-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
@@ -15,8 +15,6 @@
 [![Cloudflare Zero Trust](https://img.shields.io/badge/Ingress-Cloudflare_Zero_Trust-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](https://www.cloudflare.com/zero-trust/)
 [![Security: Non-Root](https://img.shields.io/badge/Container-Non--Root_(UID_1000)-2EA043?style=for-the-badge&logo=linux&logoColor=white)](#%EF%B8%8F-security--zero-trust-posture)
 
-<br />
-**All the demo platforms currently deployed and running under my main domain are not publicly accessible. Please, email me if you would like a live demo. Thank you.**
 <br />
 
 **A low-latency, memory-disciplined Semantic Search & Retrieval-Augmented Generation (RAG) Knowledge Hub engineered specifically for constrained ARM64 edge hardware.**
@@ -77,12 +75,13 @@ flowchart LR
         Ollama["🦙 Host Ollama Engine (:11434)\ngemma3:1b • gemma2-2048:latest\ngemma2:2b • deepseek-r1:1.5b\ntinyllama:latest"]
 
         subgraph Bridge["🐳 Docker Bridge Network: edge_rag_internal"]
-            CFD["🚇 edge-cloudflared\ncloudflare/cloudflared:latest\nRAM: 256M | CPU: 0.5"]
+            CFD["🚇 edge-cloudflared\nDebian Bookworm + Cloudflare APT\nBoot: apt update & upgrade -y\nRAM: 256M | CPU: 0.5"]
             UI["⚡ edge-rag-ui\nPython 3.11 + Streamlit :8501\nFastEmbed ONNX + ingest.py\nRAM: 1536M | CPU: 2.0"]
             Qdrant["🦀 edge-qdrant\nqdrant/qdrant:latest :6333\nHNSW + Keyword Index\nRAM: 1536M | CPU: 2.0"]
         end
 
-        subgraph Storage["💽 Persistent Host Bind Mounts (UID 1000:1000)"]
+        subgraph Storage["💽 Persistent Host Bind Mounts"]
+            CFDData[("🚇 ./cloudflared_data\nPersisted Binary + APT Cache")]
             KB[("📂 ./knowledge_base\nnotes/ & repos/")]
             Cache[("📦 ./fastembed_cache\nbge-small-en-v1.5-onnx-q")]
             QData[("🗄️ ./qdrant_data\nWAL + MMap Vectors + Payloads")]
@@ -93,6 +92,7 @@ flowchart LR
     User ==>|"HTTPS"| CF
     CF <==>|"Outbound Tunnel\n(TUNNEL_TOKEN)"| CFD
     CFD ==>|"HTTP :8501"| UI
+    CFD --- CFDData
     UI <==>|"REST API :6333\n(QDRANT_API_KEY)"| Qdrant
     UI ==>|"host.docker.internal:11434\n(Local RAG Synthesis)"| Ollama
     UI -.->|"git clone / pull\n(Downstream Sync)"| GitHub
@@ -165,6 +165,10 @@ edge-rag-hub/
 │   ├── 🔄 ingest.py                      # Automated knowledge_base feeder, header chunker & downstream Git sync CLI
 │   ├── 🕰️ main.py.old                    # Historical snapshot preserved for reference
 │   └── 📋 requirements.txt               # Pinned dependencies (streamlit, qdrant-client, fastembed, pandas, openai)
+├── 📁 cloudflared/                       # Self-updating Cloudflare Tunnel microservice (APT + binary persistence)
+│   ├── 🐳 Dockerfile                     # Debian Bookworm-slim + Official Cloudflare APT repo + upstream seed
+│   └── 🚀 entrypoint.sh                  # Boot-time apt update && apt upgrade -y + persistent binary sync
+├── 📁 cloudflared_data/                  # Persisted cloudflared binary, version state & APT cache (/var/lib/cloudflared)
 ├── 📁 knowledge_base/                    # Mounted into edge-rag-ui:/app/knowledge_base (UID 1000:1000)
 │   ├── 📁 notes/                         # Local & uploaded Markdown notes organized by category subfolder
 │   │   └── .gitkeep                      # Tracked in parent Git repository
@@ -277,7 +281,6 @@ The Streamlit application ([`app/main.py`](file:///z:/opt/edge-rag-hub/app/main.
 * **Public Telemetry:** Displays live **Vectors Stored**, **Dimensions (`384`)**, **KB Files** count on disk, **Git Repos** count, active **Embedder**, **LLM Engine**, and **Active Categories**.
 * **🔐 Independent Admin Sign-In (`verify_admin_credentials`):** Uses timing-attack-safe `hmac.compare_digest` verification against `ADMIN_EMAILS` (default `ts67200@gmail.com`) and `ADMIN_PASSWORD` in `.env`—operating completely independently of Cloudflare Zero Trust so the main search interface can remain open to the public while administrative actions remain locked.
 * **🔄 Sync `knowledge_base` & Git (Admin Only):** Pulls downstream Git commits across all repositories in `/app/knowledge_base` and indexes new/modified files while preserving existing category assignments.
-* **🚀 Load Sample NOC/SRE Playbooks (Admin Only):** Persists 5 curated operational playbooks into `/app/knowledge_base/notes/<Category>/` and indexes them into Qdrant using deterministic `UUIDv5` IDs.
 
 ### 2️⃣ Tab 1: `🔎 Semantic Retrieval & RAG` (Open to Public)
 * **Natural Language Querying:** Search by incident symptoms or architectural questions.
@@ -308,7 +311,7 @@ Defined in [`docker-compose.yml`](file:///z:/opt/edge-rag-hub/docker-compose.yml
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: |
 | `edge-qdrant` | `qdrant` | `qdrant/qdrant:latest` | `6333/tcp` | `127.0.0.1:6333` | `2.0` CPUs | `1536 MB` |
 | `edge-rag-ui` | `rag-ui` | Custom (`python:3.11-slim-bookworm`) | `8501/tcp` | *None (Internal)* | `2.0` CPUs | `1536 MB` |
-| `edge-cloudflared` | `cloudflared` | `cloudflare/cloudflared:latest` | *N/A* | *None (Outbound)* | `0.5` CPUs | `256 MB` |
+| `edge-cloudflared` | `cloudflared` | Custom (`debian:bookworm-slim` + Cloudflare APT) | *N/A* | *None (Outbound)* | `0.5` CPUs | `256 MB` |
 | **Total Stack Allocation** | | | | | **4.5 CPUs** | **3,328 MB (~3.25 GB)** |
 
 ---

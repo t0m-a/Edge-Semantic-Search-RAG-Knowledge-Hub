@@ -248,40 +248,6 @@ ALL_CATEGORIES = get_active_categories(qdrant)
 kb_inventory = get_kb_inventory(KNOWLEDGE_BASE_DIR)
 MODEL_CATALOG = get_model_catalog(ollama_client)
 
-# --- SAMPLE PLAYBOOKS FOR RECRUITER DEMO ---
-SAMPLE_PLAYBOOKS = [
-    {
-        "title": "BGP Peer Session Flapping & Route Dampening",
-        "category": "Network",
-        "source": "NOC-Runbook-01.md",
-        "content": "When an upstream BGP neighbor session flaps repeatedly, verify physical interface CRC errors first, check MTU mismatches (ensure 1500 or 9000 jumbo frames match across interfaces), and inspect hold-timer expiration logs before clearing soft BGP routes.",
-    },
-    {
-        "title": "Cloudflare Tunnel 502 Bad Gateway Recovery",
-        "category": "Cloud",
-        "source": "Edge-Ingress-04.md",
-        "content": "A 502 Bad Gateway error on a Cloudflare Tunnel indicates cloudflared can reach Cloudflare's edge, but cannot reach the local origin container. Verify both containers share the same Docker bridge network and reference the container service name rather than localhost.",
-    },
-    {
-        "title": "Linux Host Out-Of-Memory (OOM) Killer Triage",
-        "category": "Infrastructure",
-        "source": "SysAdmin-Playbook-12.md",
-        "content": "Inspect kernel ring buffer via dmesg -T | grep -i oom to identify which process exceeded cgroup memory limits. On edge nodes like Raspberry Pi, enforce hard mem_limit caps in Docker Compose and enable on-disk vector payloads.",
-    },
-    {
-        "title": "PostgreSQL Connection Pool Exhaustion",
-        "category": "Database",
-        "source": "DBA-Incident-08.md",
-        "content": "If application workers time out waiting for database connections, deploy PgBouncer in transaction pooling mode, audit idle_in_transaction_session_timeout settings, and terminate stalled PIDs via pg_terminate_backend.",
-    },
-    {
-        "title": "SSH Brute-Force & Zero Trust Hardening",
-        "category": "Security",
-        "source": "SecOps-Standard-03.md",
-        "content": "Eliminate public port 22 exposure on edge routers. Route administrative SSH traffic exclusively through Cloudflare Zero Trust Access policies with short-lived certificates or hardware FIDO2 keys.",
-    },
-]
-
 
 def ingest_chunks(records: list[dict], preserve_category: bool = True):
     """
@@ -452,16 +418,6 @@ with st.sidebar:
             )
             st.rerun()
 
-        if st.button("🚀 Load Sample NOC/SRE Playbooks", use_container_width=True):
-            with st.spinner("Vectorizing & indexing playbooks on Pi 5 CPU..."):
-                t0 = time.perf_counter()
-                for pb in SAMPLE_PLAYBOOKS:
-                    save_note_to_kb(pb["source"], pb["category"], pb["title"], pb["content"])
-                ingest_chunks(SAMPLE_PLAYBOOKS, preserve_category=True)
-                elapsed = (time.perf_counter() - t0) * 1000
-            st.success(f"Indexed {len(SAMPLE_PLAYBOOKS)} playbooks in {elapsed:.1f} ms!")
-            st.rerun()
-
         if st.button("🔓 Sign Out", use_container_width=True):
             st.session_state["is_admin"] = False
             st.session_state["admin_email"] = ""
@@ -572,7 +528,7 @@ with tab_search:
 
         if not results:
             st.warning(
-                "No semantic matches above threshold. Try lowering the Min Cosine Score or loading sample playbooks from the sidebar."
+                "No semantic matches above threshold. Try lowering the Min Cosine Score or adjusting the category filter."
             )
         else:
             if enable_rag:
@@ -942,5 +898,5 @@ with tab_analytics:
                     st.rerun()
         else:
             st.info(
-                "Collection is currently empty. Click 'Load Sample NOC/SRE Playbooks' in the sidebar."
+                "Collection is currently empty. Add documents or sync the knowledge base in the 'Ingest & Git Sync' tab."
             )
